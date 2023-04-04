@@ -1,0 +1,271 @@
+import os
+import cv2
+import time
+import torch
+import argparse
+import numpy as np
+
+from Detection.Utils import ResizePadding
+from CameraLoader import CamLoader, CamLoader_Q
+from DetectorLoader import TinyYOLOv3_onecls
+
+from PoseEstimateLoader import SPPE_FastPose
+from fn import draw_single
+#Track-->my_Track으로 바꿈
+from Track.my_Tracker import Detection, Tracker
+#ActionsEstLoader-->my_ActionsEstLoader로 바꿈
+from my_ActionsEstLoader import TSSTG
+
+#source = '../Data/test_video/test7.mp4'
+#source = '../Data/falldata/Home/Videos/video (2).avi'  # hard detect
+source = '../Data/falldata/Home/Videos/video (1).avi'
+#source = 2
+
+
+def preproc(image):
+    """preprocess function for CameraLoader.
+    """
+    image = resize_fn(image)
+    image = cv2.cvtColor(image, cv2.COLOR_BGR2RGB)
+    return image
+
+
+def kpt2bbox(kpt, ex=20):
+    """Get bbox that hold on all of the keypoints (x,y)
+    kpt: array of shape `(N, 2)`,
+    ex: (int) expand bounding box,
+    """
+    return np.array((kpt[:, 0].min() - ex, kpt[:, 1].min() - ex,
+                     kpt[:, 0].max() + ex, kpt[:, 1].max() + ex))
+
+
+if __name__ == '__main__':
+    par = argparse.ArgumentParser(description='Human Fall Detection Demo.')
+    par.add_argument('-C', '--camera', default=source,  # required=True,  # default=2,
+                        help='Source of camera or video file path.')
+    par.add_argument('--detection_input_size', type=int, default=384,
+                        help='Size of input in detection model in square must be divisible by 32 (int).')
+    par.add_argument('--pose_input_size', type=str, default='224x160',
+                        help='Size of input in pose model must be divisible by 32 (h, w)')
+    par.add_argument('--pose_backbone', type=str, default='resnet50',
+                        help='Backbone model for SPPE FastPose model.')
+    par.add_argument('--show_detected', default=False, action='store_true',
+                        help='Show all bounding box from detection.')
+    par.add_argument('--show_skeleton', default=True, action='store_true',
+                        help='Show skeleton pose.')
+    par.add_argument('--save_out', type=str, default='',
+                        help='Save display to video file.')
+    par.add_argument('--device', type=str, default='cuda',
+                        help='Device to run model on cpu or cuda.')
+    par.add_argument('--queue_size', type=str, default='10',
+                        help='queue size for voting, default is 10')
+    par.add_argument('--note_acc', type=bool, default=False,
+                        help='Note acc at save directory, default is False')
+    args = par.parse_args()
+
+    device = args.device
+
+    # DETECTION MODEL.
+    inp_dets = args.detection_input_size
+    detect_model = TinyYOLOv3_onecls(inp_dets, device=device)
+
+    # POSE MODEL.
+    inp_pose = args.pose_input_size.split('x')
+    inp_pose = (int(inp_pose[0]), int(inp_pose[1]))
+    pose_model = SPPE_FastPose(args.pose_backbone, inp_pose[0], inp_pose[1], device=device)
+
+    # Tracker.
+    max_age = 30
+    tracker = Tracker(max_age=max_age, n_init=3)
+
+    # Actions Estimate.
+    action_model = TSSTG()
+
+    resize_fn = ResizePadding(inp_dets, inp_dets)
+
+    cam_source = args.camera
+    if type(cam_source) is str and os.path.isfile(cam_source):
+        # Use loader thread with Q for video file.
+        cam = CamLoader_Q(cam_source, queue_size=2000, preprocess=preproc).start()
+        # subject, trial, camera정보
+        data_info_list = cam_source.split(sep='/')[-1]
+        data_info = data_info_list.split(sep='-')
+        subject = data_info[-4]
+        activity = data_info[-3]
+        trial = data_info[-2]
+        camera = data_info[-1]
+        camera = camera.split(sep='.')[0]
+    else:
+        # Use normal thread loader for webcam.
+        cam = CamLoader(int(cam_source) if cam_source.isdigit() else cam_source,
+                        preprocess=preproc).start()
+
+    #frame_size = cam.frame_size
+    #scf = torch.min(inp_size / torch.FloatTensor([frame_size]), 1)[0]
+
+    outvid = False
+    if args.save_out != '':
+        outvid = True
+        codec = cv2.VideoWriter_fourcc(*'FMP4')
+        writer = cv2.VideoWriter(args.save_out, codec, 30, (inp_dets * 2, inp_dets * 2))
+
+    fps_time = 0
+    f = 0
+    #내가 추가한 라인
+    r = 0
+    first_detect = False
+    det_tensor_save_dir = f'out/detection/2-HAR-UP-{subject}-{activity}-{trial}-{camera}'
+    os.makedirs(det_tensor_save_dir, exist_ok=True)
+    acc_activity_save_dir = f'voting_result/queue_{args.queue_size}'
+    os.makedirs(acc_activity_save_dir, exist_ok=True)
+    #정확도 테스트하려고 action저장할 리스트
+    action_list = []
+    action_win = int(args.queue_size)
+    #decision==0이면 넘어짐 발생안함
+    decision = 0
+    #207번째 줄부터 voting코드
+    while cam.grabbed():
+        f += 1
+        frame = cam.getitem()
+        image = frame.copy()
+
+        #detected값 이용할때
+        detectedpath = f'./out/detection/2-HAR-UP-{subject}-{activity}-{trial}-{camera}/result{r}.t'
+        if not(os.path.isfile(detectedpath)):
+          detected = None
+        else : 
+          detected = torch.load(detectedpath)
+
+        # Predict each tracks bbox of current frame from previous frames information with Kalman filter.
+        if detected is not None:
+            tracker.predict()
+   
+        detections = []  # List of Detections object for tracking.
+        if detected is not None:
+            #detected = non_max_suppression(detected[None, :], 0.45, 0.2)[0]
+            # Predict skeleton pose of each bboxs.
+            #poses = pose_model.predict(frame, detected[:, 0:4], detected[:, 4])
+
+            #Create Detections object.
+            # detections = [Detection(kpt2bbox(ps['keypoints'].numpy()),
+            #                         np.concatenate((ps['keypoints'].numpy(),
+            #                                         ps['kp_score'].numpy()), axis=1),
+            #                         ps['kp_score'].mean().numpy()) for ps in poses]
+
+            #pose값 ViTPose에서 얻었을 때
+            try:
+                keypoints_path = f'./out/kpt/2-HAR-UP-{subject}-{activity}-{trial}-{camera}/result%d.npy' % r         
+                keypoints_data = np.load(keypoints_path)
+                keypoints = keypoints_data[:,:2]
+                keypoints_score = keypoints_data[:,2:]
+                detections = [Detection(kpt2bbox(keypoints),
+                                        np.concatenate((keypoints,
+                                                        keypoints_score), axis=1),
+                                        np.array(keypoints_score.mean()))]
+            
+            except:
+                pass
+            # except:
+            #     detections = [Detection(kpt2bbox(ps['keypoints'].numpy()),
+            #             np.concatenate((ps['keypoints'].numpy(),
+            #                             ps['kp_score'].numpy()), axis=1),
+            #             ps['kp_score'].mean().numpy()) for ps in poses]
+            # except:
+            #     print('there is no keypoints')
+
+            # VISUALIZE.
+            if args.show_detected:
+                for bb in detected[:, 0:5]:
+                    frame = cv2.rectangle(frame, (bb[0], bb[1]), (bb[2], bb[3]), (0, 0, 255), 1)
+
+        # Update tracks by matching each track information of current and previous frame or
+        # create a new track if no matched.
+        if detected is not None:
+            tracker.update(detections)
+
+            # Predict Actions of each track.
+            for i, track in enumerate(tracker.tracks):
+                if not track.is_confirmed():
+                    continue
+
+                track_id = track.track_id
+                bbox = track.to_tlbr().astype(int)
+                center = track.get_center().astype(int)
+
+                action = 'pending..'
+                clr = (0, 255, 0)
+                # Use 30 frames time-steps to prediction.
+                if len(track.keypoints_list) == 30:
+                    pts = np.array(track.keypoints_list, dtype=np.float32)
+                    out = action_model.predict(pts, frame.shape[:2])
+                    action_name = action_model.class_names[out[0].argmax()]
+                    action = '{}: {:.2f}%'.format(action_name, out[0].max() * 100)
+                    if action_name == 'Fall Down':
+                        clr = (255, 0, 0)
+                    elif action_name == 'Lying Down':
+                        clr = (255, 200, 0)
+
+                    if args.note_acc:
+                        vote_num = []
+                        if len(action_list) < i+1:
+                            action_list.append([action_name])
+                        else:
+                            action_list[i].append(action_name)
+                        #action_list.append(action_name)
+                        if len(action_list[i]) == action_win:
+                            for class_name in action_model.class_names:
+                                vote_num.append(action_list[i].count(class_name))
+                            action_list[i].pop(0)
+                            #action을 Normal과 Fall down으로 변경해서 vote_num이 (x,x,x,x,x,x,win_size-x)로 나옴
+                            if (decision==0) and (vote_num.index(max(vote_num)) == 6):
+                                voting_result_path = os.path.join(acc_activity_save_dir, f'acc-avtivity-{activity}_majority.txt')
+                                file = open(voting_result_path, 'a')
+                                file.write(f'1 : {subject}-{activity}-{trial}-{camera}\n')
+                                file.close()
+                                decision = 1
+                                
+                
+
+                # VISUALIZE.
+                if track.time_since_update == 0:
+                    if args.show_skeleton:
+                        frame = draw_single(frame, track.keypoints_list[-1])
+                    frame = cv2.rectangle(frame, (bbox[0], bbox[1]), (bbox[2], bbox[3]), (0, 255, 0), 1)
+                    # frame = cv2.putText(frame, str(track_id), (center[0], center[1]), cv2.FONT_HERSHEY_COMPLEX,
+                    #                 0.4, (255, 0, 0), 2)
+                    frame = cv2.putText(frame, action, (bbox[0] + 5, bbox[1] + 15), cv2.FONT_HERSHEY_COMPLEX,
+                                        0.4, clr, 1)
+
+        # Show Frame.
+        frame = cv2.resize(frame, (0, 0), fx=2., fy=2.)
+        # frame = cv2.putText(frame, '%d, FPS: %f' % (f, 1.0 / (time.time() - fps_time)),
+        #                     (10, 20), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1)
+        frame = frame[:, :, ::-1]
+        fps_time = time.time()
+                #정확도 체크 하는 라인
+
+        if outvid:
+            writer.write(frame)
+        winname = 'test'
+        cv2.namedWindow(winname)
+        cv2.moveWindow(winname, 500, 500)
+        cv2.imshow(winname, frame)
+        # if f == 10 or f == 60:
+        #     cv2.imwrite(f'results/HAR-UP-11-3-1-2_action_{f}.png', frame)
+        # cv2.imshow('frame', frame)
+        r += 1
+        if cv2.waitKey(1) & 0xFF == ord('q'):
+            break
+    if args.note_acc:
+        if decision != 1:
+            voting_result_path = os.path.join(acc_activity_save_dir, f'acc-avtivity-{activity}_majority.txt')
+            file = open(voting_result_path, 'a')
+            file.write(f'0 : {subject}-{activity}-{trial}-{camera}\n')
+            file.close()
+
+    # Clear resource.
+    cam.stop()
+    if outvid:
+        writer.release()
+    cv2.destroyAllWindows()
+                

@@ -1,0 +1,10 @@
+*.avi
+*.mp4
+*.pth
+avg_result/
+max_result/
+bel_result/
+voting_result/
+results/
+result_txt/
+out/
