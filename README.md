@@ -1,4 +1,4 @@
-
+## To get results with ViTPose,you need poseresult.npy files from ViTPose 
 
 ## Reference
 - ViTPose : https://github.com/ViTAE-Transformer/ViTPose
